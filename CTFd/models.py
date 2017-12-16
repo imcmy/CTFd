@@ -8,6 +8,7 @@ from struct import unpack, pack, error as struct_error
 from flask_sqlalchemy import SQLAlchemy
 from passlib.hash import bcrypt_sha256
 from sqlalchemy.exc import DatabaseError
+from sqlalchemy.sql.expression import union_all
 
 
 def sha512(string):
@@ -29,28 +30,21 @@ db = SQLAlchemy()
 
 class Pages(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    route = db.Column(db.String(80), unique=True)
+    auth_required = db.Column(db.Boolean)
+    title = db.Column(db.String(80))
+    route = db.Column(db.Text, unique=True)
     html = db.Column(db.Text)
+    draft = db.Column(db.Boolean)
 
-    def __init__(self, route, html):
+    def __init__(self, title, route, html, draft=True, auth_required=False):
+        self.title = title
         self.route = route
         self.html = html
+        self.draft = draft
+        self.auth_required = auth_required
 
     def __repr__(self):
         return "<Pages route {0}>".format(self.route)
-
-
-class Containers(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(80))
-    buildfile = db.Column(db.Text)
-
-    def __init__(self, name, buildfile):
-        self.name = name
-        self.buildfile = buildfile
-
-    def __repr__(self):
-        return "<Container ID:(0) {1}>".format(self.id, self.name)
 
 
 class Challenges(db.Model):
@@ -60,16 +54,19 @@ class Challenges(db.Model):
     max_attempts = db.Column(db.Integer, default=0)
     value = db.Column(db.Integer)
     category = db.Column(db.String(80))
-    type = db.Column(db.Integer)
+    type = db.Column(db.String(80))
     hidden = db.Column(db.Boolean)
+    __mapper_args__ = {
+        'polymorphic_identity': 'standard',
+        'polymorphic_on': type
+    }
 
-    def __init__(self, name, description, value, category, type=0):
+    def __init__(self, name, description, value, category, type='standard'):
         self.name = name
         self.description = description
         self.value = value
         self.category = category
         self.type = type
-        # self.flags = json.dumps(flags)
 
     def __repr__(self):
         return '<chal %r>' % self.name
@@ -140,14 +137,14 @@ class Files(db.Model):
 class Keys(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     chal = db.Column(db.Integer, db.ForeignKey('challenges.id'))
-    key_type = db.Column(db.Integer)
+    type = db.Column(db.String(80))
     flag = db.Column(db.Text)
     data = db.Column(db.Text)
 
-    def __init__(self, chal, flag, key_type):
+    def __init__(self, chal, flag, type):
         self.chal = chal
         self.flag = flag
-        self.key_type = key_type
+        self.type = type
 
     def __repr__(self):
         return "<Flag {0} for challenge {1}>".format(self.flag, self.chal)
@@ -177,7 +174,7 @@ class Teams(db.Model):
 
     def score(self, admin=False):
         score = db.func.sum(Challenges.value).label('score')
-        team = db.session.query(Solves.teamid, score).join(Teams).join(Challenges).filter(Teams.banned == False, Teams.id == self.id)
+        team = db.session.query(Solves.teamid, score).join(Teams).join(Challenges).filter(Teams.id == self.id)
         award_score = db.func.sum(Awards.value).label('award_score')
         award = db.session.query(award_score).filter_by(teamid=self.id)
 
@@ -192,28 +189,72 @@ class Teams(db.Model):
         team = team.group_by(Solves.teamid).first()
         award = award.first()
 
-        if team:
+        if team and award:
             return int(team.score or 0) + int(award.award_score or 0)
+        elif team:
+            return int(team.score or 0)
+        elif award:
+            return int(award.award_score or 0)
         else:
             return 0
 
     def place(self, admin=False):
-        score = db.func.sum(Challenges.value).label('score')
-        quickest = db.func.max(Solves.date).label('quickest')
-        teams = db.session.query(Solves.teamid).join(Teams).join(Challenges).filter(Teams.banned == False)
+        """
+        This method is generally a clone of CTFd.scoreboard.get_standings.
+        The point being that models.py must be self-reliant and have little
+        to no imports within the CTFd application as importing from the
+        application itself will result in a circular import.
+        """
+        scores = db.session.query(
+            Solves.teamid.label('teamid'),
+            db.func.sum(Challenges.value).label('score'),
+            db.func.max(Solves.id).label('id'),
+            db.func.max(Solves.date).label('date')
+        ).join(Challenges).group_by(Solves.teamid)
+
+        awards = db.session.query(
+            Awards.teamid.label('teamid'),
+            db.func.sum(Awards.value).label('score'),
+            db.func.max(Awards.id).label('id'),
+            db.func.max(Awards.date).label('date')
+        ).group_by(Awards.teamid)
 
         if not admin:
             freeze = Config.query.filter_by(key='freeze').first()
             if freeze and freeze.value:
                 freeze = int(freeze.value)
                 freeze = datetime.datetime.utcfromtimestamp(freeze)
-                teams = teams.filter(Solves.date < freeze)
+                scores = scores.filter(Solves.date < freeze)
+                awards = awards.filter(Awards.date < freeze)
 
-        teams = teams.group_by(Solves.teamid).order_by(score.desc(), quickest).all()
+        results = union_all(scores, awards).alias('results')
+
+        sumscores = db.session.query(
+            results.columns.teamid,
+            db.func.sum(results.columns.score).label('score'),
+            db.func.max(results.columns.id).label('id'),
+            db.func.max(results.columns.date).label('date')
+        ).group_by(results.columns.teamid).subquery()
+
+        if admin:
+            standings_query = db.session.query(
+                Teams.id.label('teamid'),
+            )\
+                .join(sumscores, Teams.id == sumscores.columns.teamid) \
+                .order_by(sumscores.columns.score.desc(), sumscores.columns.id)
+        else:
+            standings_query = db.session.query(
+                Teams.id.label('teamid'),
+            )\
+                .join(sumscores, Teams.id == sumscores.columns.teamid) \
+                .filter(Teams.banned == False) \
+                .order_by(sumscores.columns.score.desc(), sumscores.columns.id)
+
+        standings = standings_query.all()
 
         # http://codegolf.stackexchange.com/a/4712
         try:
-            i = teams.index((self.id,)) + 1
+            i = standings.index((self.id,)) + 1
             k = i % 10
             return "%d%s" % (i, "tsnrhtdd"[(i / 10 % 10 != 1) * (k < 4) * k::4])
         except ValueError:
